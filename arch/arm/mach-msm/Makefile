@@ -429,6 +429,7 @@ obj-$(CONFIG_MSM_CPR_REGULATOR) += cpr-regulator.o
 obj-y += lge_moca_drv.o 
 obj-y += moca_kernel_probe.o 
 obj-$(CONFIG_CPU_FREQ_MSM) += cpufreq.o
+obj-$(CONFIG_INTELLI_PLUG) += intelli_plug.o
 obj-$(CONFIG_MSM_DEVFREQ_CPUBW) += devfreq_cpubw.o
 
 obj-$(CONFIG_WALL_CLK) += wallclk.o
