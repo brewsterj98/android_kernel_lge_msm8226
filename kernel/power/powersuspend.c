@@ -139,6 +139,7 @@ void set_power_suspend_state(int new_state)
 
 	spin_lock_irqsave(&state_lock, irqflags);
 	old_sleep = state;
+<<<<<<< HEAD
 	if (old_sleep == POWER_SUSPEND_INACTIVE && new_state == POWER_SUSPEND_ACTIVE) {
 #ifdef POWER_SUSPEND_DEBUG
 		pr_warn("power_suspend: activated.\n");
