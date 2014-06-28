@@ -1309,8 +1309,7 @@ pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 	 */
 	if (!left || (curr && entity_before(curr, left)))
 		left = curr;
-
-	se = left; /* ideally we run the leftmost entity */
+        se = left; /* ideally we run the leftmost entity */
 
 	/*
 	 * Avoid running the skip buddy, if running something else can
