@@ -55,7 +55,7 @@ int simple_gpu_algorithm(int level,
 		} else if (level == (priv->bus.num - 1))
 			val = 0; /* already @ min, so do nothing */
 	}
-	return val;
+	return val = 0;
 }
 EXPORT_SYMBOL(simple_gpu_algorithm);
 
