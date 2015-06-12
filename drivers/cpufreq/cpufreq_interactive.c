@@ -23,6 +23,7 @@
 #include <linux/moduleparam.h>
 #include <linux/rwsem.h>
 #include <linux/sched.h>
+#include <linux/sched/rt.h>
 #include <linux/tick.h>
 #include <linux/time.h>
 #include <linux/timer.h>
@@ -54,7 +55,11 @@ struct cpufreq_interactive_cpuinfo {
 	struct rw_semaphore enable_sem;
 	int governor_enabled;
 	int prev_load;
+	bool limits_changed;
+	unsigned int nr_timer_resched;
 };
+
+#define MIN_TIMER_JIFFIES 1UL
 
 static DEFINE_PER_CPU(struct cpufreq_interactive_cpuinfo, cpuinfo);
 
@@ -146,42 +151,6 @@ struct cpufreq_governor cpufreq_gov_interactive = {
 	.owner = THIS_MODULE,
 };
 
-static inline cputime64_t get_cpu_idle_time_jiffy(unsigned int cpu,
-						  cputime64_t *wall)
-{
-	u64 idle_time;
-	u64 cur_wall_time;
-	u64 busy_time;
-
-	cur_wall_time = jiffies64_to_cputime64(get_jiffies_64());
-
-	busy_time  = kcpustat_cpu(cpu).cpustat[CPUTIME_USER];
-	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_SYSTEM];
-	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_IRQ];
-	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_SOFTIRQ];
-	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_STEAL];
-	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_NICE];
-
-	idle_time = cur_wall_time - busy_time;
-	if (wall)
-		*wall = jiffies_to_usecs(cur_wall_time);
-
-	return jiffies_to_usecs(idle_time);
-}
-
-static inline cputime64_t get_cpu_idle_time(unsigned int cpu,
-					    cputime64_t *wall)
-{
-	u64 idle_time = get_cpu_idle_time_us(cpu, wall);
-
-	if (idle_time == -1ULL)
-		idle_time = get_cpu_idle_time_jiffy(cpu, wall);
-	else if (!io_is_busy)
-		idle_time += get_cpu_iowait_time_us(cpu, wall);
-
-	return idle_time;
-}
-
 static void cpufreq_interactive_timer_resched(
 	struct cpufreq_interactive_cpuinfo *pcpu)
 {
@@ -191,7 +160,7 @@ static void cpufreq_interactive_timer_resched(
 	spin_lock_irqsave(&pcpu->load_lock, flags);
 	pcpu->time_in_idle =
 		get_cpu_idle_time(smp_processor_id(),
-				     &pcpu->time_in_idle_timestamp);
+				     &pcpu->time_in_idle_timestamp, io_is_busy);
 	pcpu->cputime_speedadj = 0;
 	pcpu->cputime_speedadj_timestamp = pcpu->time_in_idle_timestamp;
 	expires = jiffies + usecs_to_jiffies(timer_rate);
@@ -209,11 +178,15 @@ static void cpufreq_interactive_timer_resched(
  * The cpu_timer and cpu_slack_timer must be deactivated when calling this
  * function.
  */
-static void cpufreq_interactive_timer_start(int cpu)
+static void cpufreq_interactive_timer_start(int cpu, int time_override)
 {
 	struct cpufreq_interactive_cpuinfo *pcpu = &per_cpu(cpuinfo, cpu);
-	unsigned long expires = jiffies + usecs_to_jiffies(timer_rate);
 	unsigned long flags;
+	unsigned long expires;
+	if (time_override)
+		expires = jiffies + time_override;
+	else
+		expires = jiffies + usecs_to_jiffies(timer_rate);
 
 	pcpu->cpu_timer.expires = expires;
 	add_timer_on(&pcpu->cpu_timer, cpu);
@@ -225,7 +198,8 @@ static void cpufreq_interactive_timer_start(int cpu)
 
 	spin_lock_irqsave(&pcpu->load_lock, flags);
 	pcpu->time_in_idle =
-		get_cpu_idle_time(cpu, &pcpu->time_in_idle_timestamp);
+		get_cpu_idle_time(cpu, &pcpu->time_in_idle_timestamp,
+			  io_is_busy);
 	pcpu->cputime_speedadj = 0;
 	pcpu->cputime_speedadj_timestamp = pcpu->time_in_idle_timestamp;
 	spin_unlock_irqrestore(&pcpu->load_lock, flags);
@@ -366,7 +340,7 @@ static u64 update_load(int cpu)
 	unsigned int delta_time;
 	u64 active_time;
 
-	now_idle = get_cpu_idle_time(cpu, &now);
+	now_idle = get_cpu_idle_time(cpu, &now, io_is_busy);
 	delta_idle = (unsigned int)(now_idle - pcpu->time_in_idle);
 	delta_time = (unsigned int)(now - pcpu->time_in_idle_timestamp);
 
@@ -405,8 +379,7 @@ static void cpufreq_interactive_timer(unsigned long data)
 	if (!pcpu->governor_enabled)
 		goto exit;
 
-	if (cpu_is_offline(data))
-		goto exit;
+	pcpu->nr_timer_resched = 0;
 
 	spin_lock_irqsave(&pcpu->load_lock, flags);
 	now = update_load(data);
@@ -485,6 +458,13 @@ static void cpufreq_interactive_timer(unsigned long data)
 	else
 		mod_min_sample_time = min_sample_time;
 
+	if (pcpu->limits_changed) {
+		if (sampling_down_factor &&
+			(pcpu->policy->cur != pcpu->policy->max))
+			mod_min_sample_time = 0;
+		pcpu->limits_changed = false;
+	}
+
 	if (new_freq < pcpu->floor_freq) {
 		if (now - pcpu->floor_validate_time < mod_min_sample_time) {
 			trace_cpufreq_interactive_notyet(
@@ -542,21 +522,16 @@ exit:
 
 static void cpufreq_interactive_idle_start(void)
 {
-	int cpu = smp_processor_id();
-	struct cpufreq_interactive_cpuinfo *pcpu = &per_cpu(cpuinfo, cpu);
+	struct cpufreq_interactive_cpuinfo *pcpu = 
+	      &per_cpu(cpuinfo, smp_processor_id());
 	int pending;
 	u64 now;
 
 	if (!down_read_trylock(&pcpu->enable_sem))
 		return;
-	if (!pcpu->governor_enabled)
-		goto exit;
-
-	/* Cancel the timer if cpu is offline */
-	if (cpu_is_offline(cpu)) {
-		del_timer(&pcpu->cpu_timer);
-		del_timer(&pcpu->cpu_slack_timer);
-		goto exit;
+	if (!pcpu->governor_enabled) {
+	      up_read(&pcpu->enable_sem);
+	      return;
 	}
 
 	pending = timer_pending(&pcpu->cpu_timer);
@@ -583,7 +558,6 @@ static void cpufreq_interactive_idle_start(void)
 		}
 	}
 
-exit:
 	up_read(&pcpu->enable_sem);
 }
 
@@ -1237,6 +1211,7 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 	unsigned int j;
 	struct cpufreq_interactive_cpuinfo *pcpu;
 	struct cpufreq_frequency_table *freq_table;
+	unsigned long expire_time;
 
 	switch (event) {
 	case CPUFREQ_GOV_START:
@@ -1263,7 +1238,7 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 			down_write(&pcpu->enable_sem);
 			del_timer_sync(&pcpu->cpu_timer);
 			del_timer_sync(&pcpu->cpu_slack_timer);
-			cpufreq_interactive_timer_start(j);
+			cpufreq_interactive_timer_start(j, 0);
 			pcpu->governor_enabled = 1;
 			up_write(&pcpu->enable_sem);
 		}
@@ -1277,7 +1252,10 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 			return 0;
 		}
 
-		rc = sysfs_create_group(cpufreq_global_kobject,
+		if (!have_governor_per_policy())
+			WARN_ON(cpufreq_get_global_kobject());
+
+		rc = sysfs_create_group(get_governor_parent_kobj(policy),
 				&interactive_attr_group);
 		if (rc) {
 			mutex_unlock(&gov_lock);
@@ -1310,8 +1288,10 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 		cpufreq_unregister_notifier(
 			&cpufreq_notifier_block, CPUFREQ_TRANSITION_NOTIFIER);
 		idle_notifier_unregister(&cpufreq_interactive_idle_nb);
-		sysfs_remove_group(cpufreq_global_kobject,
+		sysfs_remove_group(get_governor_parent_kobj(policy),
 				&interactive_attr_group);
+		if (!have_governor_per_policy())
+			cpufreq_put_global_kobject();
 		mutex_unlock(&gov_lock);
 
 		break;
@@ -1336,18 +1316,59 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 			/* update target_freq firstly */
 			if (policy->max < pcpu->target_freq)
 				pcpu->target_freq = policy->max;
-			else if (policy->min > pcpu->target_freq)
-				pcpu->target_freq = policy->min;
+			/*
+			* Delete and reschedule timer.
+			* Else the timer callback may return without
+			* re-arming the timer when it fails to acquire
+			* the semaphore. This race condition may cause the
+			* timer to stop unexpectedly.
+			*/
 
-			/* Reschedule timer.
-			 * Delete the timers, else the timer callback may
-			 * return without re-arm the timer when failed
-			 * acquire the semaphore. This race may cause timer
-			 * stopped unexpectedly.
-			 */
 			del_timer_sync(&pcpu->cpu_timer);
 			del_timer_sync(&pcpu->cpu_slack_timer);
-			cpufreq_interactive_timer_start(j);
+			
+			if (pcpu->nr_timer_resched) {
+				if (pcpu->policy->min >= pcpu->target_freq)
+					pcpu->target_freq = pcpu->policy->min;
+				/*
+				 * To avoid deferring load evaluation for a
+				 * long time rearm the timer for the same jiffy
+				 * as it was supposed to fire at, if it has
+				 * already been rescheduled once. The timer
+				 * start and rescheduling functions aren't used
+				 * here so that the timestamps used for load
+				 * calculations do not get reset.
+				 */
+				add_timer_on(&pcpu->cpu_timer, j);
+				if (timer_slack_val >= 0 && pcpu->target_freq >
+							pcpu->policy->min)
+					add_timer_on(&pcpu->cpu_slack_timer, j);
+			} else if (policy->min >= pcpu->target_freq) {
+				pcpu->target_freq = policy->min;
+				/*
+				 * Reschedule timer.
+				 * The governor needs more time to evaluate
+				 * the load after changing policy parameters.
+				 */
+				cpufreq_interactive_timer_start(j, 0);
+				pcpu->nr_timer_resched++;
+			} else {
+				/*
+				 * Reschedule timer with variable duration.
+				 * No boost was applied so the governor
+				 * doesn't need extra time to evaluate load.
+				 * The timer can be set to fire quicker if it
+				 * was already going to expire soon.
+				 */
+				expire_time = pcpu->cpu_timer.expires - jiffies;
+				expire_time = min(usecs_to_jiffies(timer_rate),
+						  expire_time);
+				expire_time = max(MIN_TIMER_JIFFIES,
+						  expire_time);
+				cpufreq_interactive_timer_start(j, expire_time);
+				pcpu->nr_timer_resched++;
+			}
+			pcpu->limits_changed = true;
 			up_write(&pcpu->enable_sem);
 		}
 		break;
